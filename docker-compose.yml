@@ -19,6 +19,7 @@ services:
       - cricket-network
 
   backend-rust:
+    image: ghcr.io/suhasdissa/cricketlivescore:latest
     build:
       context: ./
       dockerfile: Dockerfile
