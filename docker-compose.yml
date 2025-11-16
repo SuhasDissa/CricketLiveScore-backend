@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: cricket-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - cricket-network
+
+  backend-rust:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    container_name: cricket-backend-rust
+    ports:
+      - "3001:3001"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - HOST=0.0.0.0
+      - PORT=3001
+      - RUST_LOG=info
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - cricket-network
+
+networks:
+  cricket-network:
+    driver: bridge
+
+volumes:
+  redis-data:
+    driver: local
