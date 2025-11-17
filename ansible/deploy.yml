@@ -1,0 +1,439 @@
+---
+- name: Deploy Cricket Live Score Backend
+  hosts: cricket-vps
+  become: yes
+  gather_facts: yes
+
+  tasks:
+    # ============================================================
+    # System Updates and Dependencies
+    # ============================================================
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    # ============================================================
+    # Check Podman Installation Status
+    # ============================================================
+    - name: Check if Podman is installed
+      command: which podman
+      register: podman_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Check if podman-compose is installed
+      command: which podman-compose
+      register: podman_compose_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Check if Podman is running
+      shell: |
+        export XDG_RUNTIME_DIR=/run/user/$(id -u)
+        podman --version && podman ps > /dev/null 2>&1
+      become_user: "{{ ansible_user }}"
+      register: podman_running
+      changed_when: false
+      failed_when: false
+      when: podman_installed.rc == 0
+
+    - name: Set Podman installation facts
+      set_fact:
+        podman_needs_install: "{{ podman_installed.rc != 0 or podman_compose_installed.rc != 0 }}"
+        podman_is_working: "{{ podman_installed.rc == 0 and podman_running.rc == 0 }}"
+
+    # ============================================================
+    # Install Dependencies (Conditional)
+    # ============================================================
+    - name: Install required system packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+          - python3-pip
+          - ufw
+          - nginx
+        state: present
+      when: podman_needs_install
+
+    - name: Install Podman and podman-compose
+      apt:
+        name:
+          - podman
+          - podman-compose
+          - slirp4netns
+          - fuse-overlayfs
+        state: present
+        update_cache: yes
+      when: podman_needs_install
+
+    # ============================================================
+    # Podman Configuration (Idempotent)
+    # ============================================================
+    - name: Enable podman socket for rootless mode
+      systemd:
+        name: "podman.socket"
+        state: started
+        enabled: yes
+        scope: user
+      become_user: "{{ ansible_user }}"
+      ignore_errors: yes
+      when: not podman_is_working
+
+    - name: Configure subuid and subgid for rootless podman
+      lineinfile:
+        path: "{{ item.path }}"
+        line: "{{ ansible_user }}:100000:65536"
+        create: yes
+        state: present
+      loop:
+        - { path: '/etc/subuid' }
+        - { path: '/etc/subgid' }
+      when: not podman_is_working
+
+    - name: Create podman user configuration directory
+      file:
+        path: "/home/{{ ansible_user }}/.config/containers"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Configure podman registries (docker.io, ghcr.io)
+      copy:
+        dest: "/home/{{ ansible_user }}/.config/containers/registries.conf"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+        content: |
+          unqualified-search-registries = ["docker.io", "ghcr.io"]
+
+          [[registry]]
+          location = "docker.io"
+
+          [[registry]]
+          location = "ghcr.io"
+
+    - name: Configure podman to use docker-compose.yml format
+      copy:
+        dest: "/home/{{ ansible_user }}/.config/containers/containers.conf"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+        content: |
+          [engine]
+          compose_providers=["podman-compose"]
+
+    # ============================================================
+    # Application Deployment
+    # ============================================================
+    - name: Create deployment directory
+      file:
+        path: "{{ deploy_dir }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Copy docker-compose.yml to VPS
+      copy:
+        src: ../docker-compose.yml
+        dest: "{{ deploy_dir }}/docker-compose.yml"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+      register: compose_file_changed
+
+    - name: Check if lingering is already enabled
+      stat:
+        path: "/var/lib/systemd/linger/{{ ansible_user }}"
+      register: linger_status
+
+    - name: Enable lingering for user (allows rootless containers to run without login)
+      command: loginctl enable-linger {{ ansible_user }}
+      when: not linger_status.stat.exists
+      ignore_errors: yes
+
+    - name: Check for running containers
+      shell: |
+        export XDG_RUNTIME_DIR=/run/user/$(id -u)
+        podman ps --filter "name=cricket-" --format "{% raw %}{{.Names}}{% endraw %}" 2>/dev/null || true
+      become_user: "{{ ansible_user }}"
+      register: running_containers
+      changed_when: false
+
+    - name: Stop and remove existing containers and pods (only if compose file changed)
+      shell: |
+        export XDG_RUNTIME_DIR=/run/user/$(id -u)
+        podman-compose down 2>&1 || true
+        podman rm -f cricket-redis cricket-backend-rust 2>&1 || true
+        podman pod rm -f pod_cricket-backend 2>&1 || true
+        podman network prune -f 2>&1 || true
+      args:
+        chdir: "{{ deploy_dir }}"
+      become_user: "{{ ansible_user }}"
+      when: compose_file_changed.changed or running_containers.stdout_lines | length > 0
+
+    - name: Pull latest Podman images
+      shell: |
+        export XDG_RUNTIME_DIR=/run/user/$(id -u)
+        podman-compose pull 2>&1
+      args:
+        chdir: "{{ deploy_dir }}"
+      become_user: "{{ ansible_user }}"
+      register: podman_pull
+      changed_when: "'Pulling' in podman_pull.stdout or 'Downloaded' in podman_pull.stdout"
+
+    - name: Start Podman Compose services
+      shell: |
+        export XDG_RUNTIME_DIR=/run/user/$(id -u)
+        podman-compose up -d 2>&1
+      args:
+        chdir: "{{ deploy_dir }}"
+      become_user: "{{ ansible_user }}"
+      register: podman_up
+      changed_when: "'Creating' in podman_up.stdout or 'Starting' in podman_up.stdout"
+
+    - name: Wait for containers to be healthy
+      shell: |
+        export XDG_RUNTIME_DIR=/run/user/$(id -u)
+        for i in {1..10}; do
+          if podman ps --filter "name=cricket-backend-rust" --filter "status=running" | grep -q cricket-backend-rust; then
+            exit 0
+          fi
+          sleep 2
+        done
+        exit 1
+      become_user: "{{ ansible_user }}"
+      register: health_check
+      retries: 2
+      delay: 5
+      until: health_check.rc == 0
+      ignore_errors: yes
+
+    - name: Verify container status
+      shell: |
+        export XDG_RUNTIME_DIR=/run/user/$(id -u)
+        podman ps --filter "name=cricket-" --format "table {% raw %}{{.Names}}\t{{.Status}}\t{{.Ports}}{% endraw %}"
+      become_user: "{{ ansible_user }}"
+      register: podman_status
+      changed_when: false
+
+    - name: Display container status
+      debug:
+        msg: "{{ podman_status.stdout_lines }}"
+      when: podman_status.stdout_lines | length > 0
+
+    # ============================================================
+    # Systemd Service for Auto-start
+    # ============================================================
+    - name: Get user UID for XDG_RUNTIME_DIR
+      command: id -u {{ ansible_user }}
+      register: ansible_user_uid
+      changed_when: false
+
+    - name: Create systemd user directory
+      file:
+        path: "/home/{{ ansible_user }}/.config/systemd/user"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0755'
+
+    - name: Install systemd service for cricket backend
+      template:
+        src: templates/cricket-backend.service.j2
+        dest: "/home/{{ ansible_user }}/.config/systemd/user/cricket-backend.service"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: '0644'
+      register: systemd_service_changed
+
+    - name: Reload systemd user daemon
+      systemd:
+        daemon_reload: yes
+        scope: user
+      become_user: "{{ ansible_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid.stdout }}"
+      when: systemd_service_changed.changed
+
+    - name: Enable and start cricket backend service
+      systemd:
+        name: cricket-backend
+        enabled: yes
+        state: started
+        scope: user
+      become_user: "{{ ansible_user }}"
+      environment:
+        XDG_RUNTIME_DIR: "/run/user/{{ ansible_user_uid.stdout }}"
+
+    # ============================================================
+    # Nginx Configuration
+    # ============================================================
+    - name: Ensure Nginx is installed
+      apt:
+        name: nginx
+        state: present
+
+    - name: Check if default Nginx site exists
+      stat:
+        path: /etc/nginx/sites-enabled/default
+      register: default_site
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      when: default_site.stat.exists
+      notify: Reload Nginx
+
+    - name: Check if Nginx config already exists
+      stat:
+        path: "/etc/nginx/sites-available/{{ app_domain }}"
+      register: nginx_config_exists
+
+    - name: Create Nginx configuration for cricket backend (only if doesn't exist)
+      template:
+        src: templates/nginx-cricket.conf.j2
+        dest: "/etc/nginx/sites-available/{{ app_domain }}"
+        owner: root
+        group: root
+        mode: '0644'
+        force: no
+      when: not nginx_config_exists.stat.exists
+      notify: Reload Nginx
+
+    - name: Check if Nginx site is enabled
+      stat:
+        path: "/etc/nginx/sites-enabled/{{ app_domain }}"
+      register: nginx_enabled
+
+    - name: Enable Nginx site
+      file:
+        src: "/etc/nginx/sites-available/{{ app_domain }}"
+        dest: "/etc/nginx/sites-enabled/{{ app_domain }}"
+        state: link
+      when: not nginx_enabled.stat.exists
+      notify: Reload Nginx
+
+    - name: Test Nginx configuration
+      command: nginx -t
+      changed_when: false
+      register: nginx_test
+      failed_when: nginx_test.rc != 0
+
+    - name: Ensure Nginx is started and enabled
+      systemd:
+        name: nginx
+        state: started
+        enabled: yes
+
+    # ============================================================
+    # SSL/TLS Certificate with Certbot
+    # ============================================================
+    - name: Check if SSL certificate already exists
+      stat:
+        path: "/etc/letsencrypt/live/{{ app_domain }}/fullchain.pem"
+      register: ssl_cert
+
+    - name: Install Certbot and Nginx plugin (only if SSL cert doesn't exist)
+      apt:
+        name:
+          - certbot
+          - python3-certbot-nginx
+        state: present
+      when: not ssl_cert.stat.exists
+
+    - name: Obtain SSL certificate with Certbot
+      command: >
+        certbot --nginx
+        -d {{ app_domain }}
+        --non-interactive
+        --agree-tos
+        --redirect
+        --email {{ certbot_email | default('admin@' + app_domain) }}
+      when: not ssl_cert.stat.exists
+      register: certbot_result
+
+    - name: Display Certbot result
+      debug:
+        msg: "{{ certbot_result.stdout_lines }}"
+      when: certbot_result is defined and certbot_result.changed
+
+    - name: Test Nginx configuration after SSL setup
+      command: nginx -t
+      changed_when: false
+      when: certbot_result is defined and certbot_result.changed
+
+    - name: Reload Nginx after SSL setup
+      systemd:
+        name: nginx
+        state: reloaded
+      when: certbot_result is defined and certbot_result.changed
+
+    - name: Check if Certbot timer is enabled
+      systemd:
+        name: certbot.timer
+        enabled: yes
+        state: started
+      when: not ssl_cert.stat.exists
+
+    # ============================================================
+    # UFW Firewall Configuration
+    # ============================================================
+    - name: Check if UFW is already configured
+      command: ufw status
+      register: ufw_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set UFW fact
+      set_fact:
+        ufw_inactive: "{{ 'Status: inactive' in ufw_check.stdout or ufw_check.rc != 0 }}"
+
+    - name: Configure UFW default policies
+      community.general.ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: 'incoming', policy: 'deny' }
+        - { direction: 'outgoing', policy: 'allow' }
+      when: ufw_inactive
+
+    - name: Configure UFW firewall rules
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: "{{ item.proto }}"
+        comment: "{{ item.comment }}"
+      loop:
+        - { port: '22', proto: 'tcp', comment: 'SSH' }
+        - { port: '80', proto: 'tcp', comment: 'Nginx HTTP' }
+        - { port: '443', proto: 'tcp', comment: 'Nginx HTTPS' }
+        - { port: '41641', proto: 'udp', comment: 'Tailscale' }
+
+    - name: Enable UFW (if not already enabled)
+      community.general.ufw:
+        state: enabled
+      when: ufw_inactive
+
+    - name: Verify UFW status
+      command: ufw status numbered
+      register: ufw_status_final
+      changed_when: false
+
+    - name: Display UFW status
+      debug:
+        msg: "{{ ufw_status_final.stdout_lines }}"
+      when: ufw_status_final.stdout_lines | length > 0
+
+  handlers:
+    - name: Reload Nginx
+      systemd:
+        name: nginx
+        state: reloaded

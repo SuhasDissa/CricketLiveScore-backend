@@ -1,0 +1,12 @@
+# Ignore actual inventory file with sensitive data
+inventory.yml
+
+# Ignore any vault files
+*.vault
+
+# Ignore any private key files
+*.pem
+*.key
+
+# Ignore retry files
+*.retry
