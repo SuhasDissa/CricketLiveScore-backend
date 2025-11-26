@@ -41,7 +41,7 @@ This is a super fast and lightweight backend I built in Rust for pushing live cr
 │ Redis                                       │
 │ - match:{id}:info                           │
 │ - match:{id}:score                          │
-│ - match:{id}:scorecard:inn_{1|2}             │
+│ - match:{id}:scorecard:{1|2}                │
 └─────────────────────────────────────────────┘
 ```
 Basically, frontend hits the backend via HTTP or WS, backend talks to Redis for data and listens for updates to push out.

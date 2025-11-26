@@ -49,7 +49,7 @@ impl RedisClient {
 
                 // Only include "Live" matches
                 if let Some(status) = score_hash.get("match_status") {
-                    if status != "Live" {
+                    if status != "Live" && status != "in_progress" && status != "active" {
                         continue;
                     }
                 }
@@ -98,6 +98,7 @@ impl RedisClient {
                     team_b_score,
                     overs,
                     status: score_hash.get("match_status").cloned().unwrap_or_default(),
+                    stage: info_hash.get("stage").cloned(),
                 });
             }
             debug!("Found {} live matches", matches.len());
@@ -133,7 +134,7 @@ impl RedisClient {
         let score = LiveScore::from_redis_hash(score_hash)?;
 
         // Get scorecards
-        let scorecard_1_key = format!("match:{match_id}:scorecard:inn_1");
+        let scorecard_1_key = format!("match:{match_id}:scorecard:1");
         let scorecard_1_hash: HashMap<String, String> =
             conn.hgetall(&scorecard_1_key).await.unwrap_or_default();
 
@@ -143,7 +144,7 @@ impl RedisClient {
             None
         };
 
-        let scorecard_2_key = format!("match:{match_id}:scorecard:inn_2");
+        let scorecard_2_key = format!("match:{match_id}:scorecard:2");
         let scorecard_2_hash: HashMap<String, String> =
             conn.hgetall(&scorecard_2_key).await.unwrap_or_default();
 
@@ -177,7 +178,7 @@ impl RedisClient {
     /// Get scorecard for a specific inning
     pub async fn get_scorecard(&self, match_id: &str, inning: u8) -> Result<Option<Scorecard>> {
         let mut conn = self.conn.clone();
-        let scorecard_key = format!("match:{match_id}:scorecard:inn_{inning}");
+        let scorecard_key = format!("match:{match_id}:scorecard:{inning}");
         let scorecard_hash: HashMap<String, String> =
             conn.hgetall(&scorecard_key).await.unwrap_or_default();
 
