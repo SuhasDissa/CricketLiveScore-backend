@@ -417,6 +417,14 @@
         - { port: '443', proto: 'tcp', comment: 'Nginx HTTPS' }
         - { port: '41641', proto: 'udp', comment: 'Tailscale' }
 
+    - name: Allow Redis access from GCP IP
+      community.general.ufw:
+        rule: allow
+        port: '6379'
+        proto: tcp
+        from_ip: "{{ redis_allowed_ip }}"
+        comment: 'Redis from GCP'
+
     - name: Enable UFW (if not already enabled)
       community.general.ufw:
         state: enabled
